@@ -9,11 +9,15 @@ import sys
 import tempfile
 import time
 
+import gi
 import github
 import pygit2
 import yaml
 from gql import Client, gql
 from gql.transport.requests import RequestsHTTPTransport
+
+gi.require_version("Json", "1.0")
+from gi.repository import Json  # noqa: E402
 
 
 def set_protected_branch(token, repo, branch):
@@ -74,6 +78,7 @@ def set_protected_branch(token, repo, branch):
 def detect_appid(dirname):
     files = []
     ret = (None, None)
+    appid = None
 
     for ext in ("yml", "yaml", "json"):
         files.extend(glob.glob(f"{dirname}/*.{ext}"))
@@ -86,32 +91,26 @@ def detect_appid(dirname):
             with open(filename) as f:
                 if ext in ("yml", "yaml"):
                     manifest = yaml.safe_load(f)
+                    if "app-id" in manifest:
+                        appid = manifest["app-id"]
+                    elif "id" in manifest:
+                        appid = manifest["id"]
                 else:
-                    result = subprocess.run(
-                        ["flatpak-builder", "--show-manifest", filename],
-                        stdout=subprocess.PIPE,
-                    )
-                    if result.returncode == 0:
-                        manifest = json.loads(result.stdout.decode("utf-8"))
-                    else:
-                        print(
-                            "flatpak-builder failed to print manifest, falling back to json Python module"
-                        )
-                        try:
-                            with open(filename) as f:
-                                manifest = json.load(f)
-                        except json.decoder.JSONDecodeError:
-                            ("Manifest is not a valid JSON")
-                            break
+                    parser = Json.Parser()
+                    if parser.load_from_file(filename):
+                        root_node = parser.get_root()
+                        if root_node.get_node_type() == Json.NodeType.OBJECT:
+                            json_object = root_node.get_object()
+                            if json_object.has_member("id"):
+                                appid = json_object.get_string_member("id")
+                            elif json_object.has_member("app-id"):
+                                appid = json_object.get_string_member("app-id")
 
-            if manifest:
+            if not appid:
+                continue
+
+            if appid:
                 manifest_file = os.path.basename(filename)
-                if "app-id" in manifest:
-                    appid = manifest["app-id"]
-                elif "id" in manifest:
-                    appid = manifest["id"]
-                else:
-                    continue
                 if os.path.splitext(manifest_file)[0] != appid:
                     print(f"Skipping {manifest_file}, does not match appid {appid}")
                     continue
@@ -168,7 +167,7 @@ def main():
     tmpdir = tempfile.TemporaryDirectory()
     print(f"Cloning {fork_url} (branch: {branch})")
     clone = pygit2.clone_repository(fork_url, tmpdir.name, checkout_branch=branch)
-    clone.update_submodules(init=True)
+    clone.submodules.update(init=True)
 
     manifest_file, appid = detect_appid(tmpdir.name)
     if manifest_file is None or appid is None:
@@ -180,7 +179,10 @@ def main():
     print("Creating new repo on Flathub")
     repo = org.create_repo(appid)
     time.sleep(5)
-    repo.edit(homepage=f"https://flathub.org/apps/details/{appid}")
+    repo.edit(
+        homepage=f"https://flathub.org/apps/details/{appid}",
+        delete_branch_on_merge=True,
+    )
 
     print("Adding flathub remote")
     clone.remotes.create(
@@ -225,15 +227,23 @@ def main():
 
     collaborators = {user.replace("@", "") for user in command.split()[1:]}
     for user in collaborators:
-        print(f"adding {user} to collaborators")
-        repo.add_to_collaborators(user, permission="push")
+        try:
+            print(f"adding {user} to collaborators")
+            repo.add_to_collaborators(user, permission="push")
+        except github.GithubException:
+            print(f"Adding {user} failed")
+            pass
 
     close_comment = (
-        f"A repository for this submission has been created: {repo.html_url}",
+        f"A repository for this submission has been created: {repo.html_url} and it will be published to Flathub in 4-5 hours.",
         "\n",
-        f"You will receive an invitation to be a collaborator which will grant you write access to the repository above. The invite can be also viewed [here]({repo.html_url}/invitations).",
+        f"You will receive an [invite]({repo.html_url}/invitations) to be a collaborator to the above repository. Please make sure to enable 2FA on GitHub and accept the invite within one week.",
         "\n",
-        "If you've never maintained an app on Flathub before, common questions are answered in the [app maintenance guide](https://docs.flathub.org/docs/for-app-authors/maintenance/). If you're the original developer (or an authorized party), [verify your app](https://docs.flathub.org/docs/for-app-authors/verification) next to let users know it's coming from you.",
+        "Please go through the [App maintenance guide](https://docs.flathub.org/docs/for-app-authors/maintenance/) if you have never maintained an app on Flathub before.",
+        "\n",
+        "If you're the original developer (or an authorized party), please [verify your app](https://docs.flathub.org/docs/for-app-authors/verification) to let users know it's coming from you.",
+        "\n",
+        "Please follow the [Flathub blog](https://docs.flathub.org/blog) for the latest announcements.",
         "\n",
         "Thanks!",
     )
